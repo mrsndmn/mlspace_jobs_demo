@@ -7,3 +7,7 @@
 pip install -r requirements.txt
 ```
 
+3. Заменяем путь к репозиторию в скриптах
+* `scripts/run_training.sh`
+* `scripts/run_training_multigpu.sh`
+
