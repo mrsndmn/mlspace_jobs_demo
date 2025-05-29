@@ -1,0 +1,20 @@
+
+# 🤝 Пример запуска:
+# mls job submit --config ./binary.yaml
+#
+# 📚 Документация по запуску задач: https://fbdocs.website.yandexcloud.net/pages/mlspace/jobs/quick_start.html
+
+job:
+  description: "Bert training #dtarasov #rnd #multimodal"
+  environment:
+    image: cr.ai.cloud.ru/aicloud-base-images/cuda12.1-torch2-py311:0.0.36
+    variables:
+      PYTHONPATH: ".:./src"
+      WANDB_API_KEY: $WANDB_API_KEY
+  resource:
+    instance_type: a100.2gpu
+    processes: 1 # Для accelerate важно запускать 1 процесс на воркер. Потому что сам запускает процессы внутри воркера.
+  script: bash /workspace-SR004.nfs2/d.tarasov/mlspace_jobs_demo/scripts/run_training_multigpu_accelerate.sh --output_dir ./bert_finetune
+  type: binary
+
+

@@ -1,0 +1,22 @@
+
+# 🤝 Пример запуска:
+# mls job submit --config ./binary_exp.yaml
+#
+# 📚 Документация по запуску задач: https://fbdocs.website.yandexcloud.net/pages/mlspace/jobs/quick_start.html
+#
+# binary_exp отличается от binary тем, что позволяет контролировать размер разделяемой памяти
+# Более подробно: https://fbdocs.website.yandexcloud.net/pages/mlspace/jobs/shared_memory.md
+
+job:
+  description: "Job Description #dtarasov #rnd #multimodal"
+  environment:
+    image: cr.ai.cloud.ru/aicloud-base-images/py3.10-torch2.1.2:0.0.40
+    variables:
+      PYTHONPATH: ".:./src"
+      # WANDB_API_KEY: "TODO"
+  resource:
+    instance_type: a100.1gpu
+  script: 'python -c "from time import sleep; sleep(1000);" '
+  type: binary_exp
+  shm_size_class: medium # small, medium, large
+
