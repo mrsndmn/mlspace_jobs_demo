@@ -1,6 +1,6 @@
 trainer_output/
 bert_finetune*
 bert_finetune_multigpu*
-train_demo*
+train_demo_lr_*
 run_massive.py
 *.yaml
