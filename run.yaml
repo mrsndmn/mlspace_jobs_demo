@@ -5,18 +5,18 @@
 # 📚 Документация по запуску задач: https://fbdocs.website.yandexcloud.net/pages/mlspace/jobs/quick_start.html
 
 job:
-  description: "Job Description #d.tarasov #rnd #multimodal"
+  description: "Token Pruning #d.tarasov #rnd #multimodal"
   environment:
     image: cr.ai.cloud.ru/aicloud-base-images/cuda12.1-torch2-py311:0.0.36
     variables:
       PYTHONPATH: ".:./src"
       WANDB_API_KEY: $WANDB_API_KEY # значение будет подставлено из окружения, в котором запускается mls
   resource:
-    instance_type: a100.2gpu
+    instance_type: a100.1gpu
     # processes: - # Сколько процессов запускать. По умолчанию запускается по количеству GPU на одном воркере - это подходит для torchrun.
-    processes: 1 # Для работы с accelerate нужно запускать 1 процесс на 1 воркер.
-    workers: 1   # Сколько запускать воркеров запускать
-  script: bash /workspace-SR004.nfs2/d.tarasov/mlspace_jobs_demo/scripts/run_training_multigpu_accelerate.sh --output_dir ./bert_finetune
+    # processes: 1 # Для работы с accelerate нужно запускать 1 процесс на 1 воркер.
+    # workers: 1   # Сколько запускать воркеров запускать
+  script: 'python -c "from time import sleep; sleep(1000);" '
   type: binary
 
 
