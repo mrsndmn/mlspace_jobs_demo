@@ -1,7 +1,0 @@
-set -ex
-
-ENV_PREFIX=/workspace-SR004.nfs2/d.tarasov/envs/jobs_demo/bin
-WORKDIR=/workspace-SR004.nfs2/d.tarasov/mlspace_jobs_demo
-
-cd $WORKDIR
-$ENV_PREFIX/python scripts/train_demo.py $@
