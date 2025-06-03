@@ -5,6 +5,9 @@ set -ex
 ENV_PREFIX=/workspace-SR004.nfs2/d.tarasov/envs/jobs_demo/bin
 WORKDIR=/workspace-SR004.nfs2/d.tarasov/mlspace_jobs_demo
 
+# Добавим в PATH префикс окружения
+PATH=$ENV_PREFIX:$PATH
+
 # Джобы запускаются под управлением MPI
 # Поэтому нам нужно получить имя мастер-ноды
 # Чтобы сохранить его в переменные окружения,
@@ -24,4 +27,4 @@ export RANK=$OMPI_COMM_WORLD_RANK
 
 # Запускаем обучение
 cd $WORKDIR
-$ENV_PREFIX/python scripts/train_demo_multinode_torchddp.py $@
+python scripts/train_demo_multinode_torchddp.py $@
