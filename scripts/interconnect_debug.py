@@ -12,6 +12,11 @@ gpus_per_node=G and N nodes the world has N*G ranks. We measure:
 
 All results in GB/s. Whether NCCL uses InfiniBand or TCP is printed by NCCL
 itself (NCCL_DEBUG=INFO): grep the logs for 'NET/IB' vs 'NET/Socket'.
+
+IMPORTANT: every pairwise communicator is created up front with dist.new_group()
+which ALL ranks call collectively. Lazy/implicit P2P comm creation goes through
+ncclCommSplit (collective over the whole world), so creating it on-demand from
+only the 2 pair members deadlocks the other ranks.
 """
 import os
 
@@ -40,7 +45,7 @@ def iters_for(nbytes):
 
 
 def time_op(op, iters, warmup, dev):
-    """Mean seconds/op via CUDA events. Every rank must call this (barrier inside)."""
+    """Mean seconds/op via CUDA events. EVERY rank must call this (barrier inside)."""
     for _ in range(warmup):
         op()
     torch.cuda.synchronize()
@@ -55,12 +60,13 @@ def time_op(op, iters, warmup, dev):
     return start.elapsed_time(end) / 1000.0 / iters
 
 
-def bench_pair(a, b, sizes, rank, dev):
-    """p2p between ranks a and b. ALL ranks call this; non-participants no-op so
-    the per-op barriers stay aligned. Returns rows only on rank a."""
+def bench_pair(lo, hi, group, sizes, rank, dev):
+    """p2p between global ranks lo<hi using a pre-created 2-rank `group`
+    (group-local 0=lo, 1=hi). ALL ranks call this; non-members no-op so the
+    per-op barriers stay aligned. Rows returned only on rank lo."""
     rows = []
-    part = rank in (a, b)
-    peer = (b if rank == a else a) if part else None
+    part = rank in (lo, hi)
+    peer_local = (1 if rank == lo else 0) if part else None
     for nbytes in sizes:
         iters, warmup = iters_for(nbytes)
         if part:
@@ -69,14 +75,14 @@ def bench_pair(a, b, sizes, rank, dev):
             rbuf = torch.empty(n, dtype=torch.float32, device=dev)
 
             def uni():
-                if rank == a:
-                    dist.send(sbuf, dst=b)
+                if rank == lo:
+                    dist.send(sbuf, group=group, group_dst=1)
                 else:
-                    dist.recv(rbuf, src=a)
+                    dist.recv(rbuf, group=group, group_src=0)
 
             def bidir():
-                ops = [dist.P2POp(dist.isend, sbuf, peer),
-                       dist.P2POp(dist.irecv, rbuf, peer)]
+                ops = [dist.P2POp(dist.isend, sbuf, group=group, group_peer=peer_local),
+                       dist.P2POp(dist.irecv, rbuf, group=group, group_peer=peer_local)]
                 for w in dist.batch_isend_irecv(ops):
                     w.wait()
         else:
@@ -88,7 +94,7 @@ def bench_pair(a, b, sizes, rank, dev):
 
         t_uni = time_op(uni, iters, warmup, dev)
         t_bi = time_op(bidir, iters, warmup, dev)
-        if rank == a:
+        if rank == lo:
             rows.append((nbytes, gbps(nbytes, t_uni), gbps(nbytes, t_bi)))
         if part:
             del sbuf, rbuf
@@ -96,13 +102,14 @@ def bench_pair(a, b, sizes, rank, dev):
     return rows
 
 
-def bench_bisection(sizes, rank, gpus_per_node, nodes, dev):
-    """All node0 GPUs send to their counterpart on node1 simultaneously.
-    Aggregate cross-node throughput = (G * msg) / slowest-flow-time. Rows on rank 0."""
+def bench_bisection(groups, sizes, rank, gpus_per_node, nodes, dev):
+    """All node0 GPUs send to their node1 counterpart at once (group i = {i, i+G}).
+    Aggregate = (G * msg) / slowest-flow-time. Rows on rank 0."""
     rows = []
     node = rank // gpus_per_node
     part = nodes >= 2 and node in (0, 1)
-    peer = (rank + gpus_per_node if node == 0 else rank - gpus_per_node) if part else None
+    group = groups[rank % gpus_per_node] if part else None
+    is_sender = part and node == 0
     for nbytes in sizes:
         iters, warmup = iters_for(nbytes)
         if part:
@@ -111,10 +118,10 @@ def bench_bisection(sizes, rank, gpus_per_node, nodes, dev):
             rbuf = torch.empty(n, dtype=torch.float32, device=dev)
 
             def op():
-                if node == 0:
-                    dist.send(sbuf, dst=peer)
+                if is_sender:
+                    dist.send(sbuf, group=group, group_dst=1)
                 else:
-                    dist.recv(rbuf, src=peer)
+                    dist.recv(rbuf, group=group, group_src=0)
         else:
             def op():
                 pass
@@ -122,9 +129,8 @@ def bench_bisection(sizes, rank, gpus_per_node, nodes, dev):
         t = time_op(op, iters, warmup, dev)
         tt = torch.tensor([t], device=dev)
         dist.all_reduce(tt, op=dist.ReduceOp.MAX)  # slowest flow bounds completion
-        tmax = tt.item()
         if rank == 0:
-            rows.append((nbytes, gbps(nbytes * gpus_per_node, tmax)))
+            rows.append((nbytes, gbps(nbytes * gpus_per_node, tt.item())))
         if part:
             del sbuf, rbuf
             torch.cuda.empty_cache()
@@ -135,7 +141,6 @@ def main():
     rank = int(os.environ.get("RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
     ngpu = torch.cuda.device_count()
-    # gpus_per_node = MPI local size (procs on this node); fall back to device count.
     gpus_per_node = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_SIZE", ngpu)) or 1
     local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", rank % gpus_per_node))
     nodes = max(world // gpus_per_node, 1)
@@ -157,7 +162,16 @@ def main():
         print(f"[interconnect] world_size={world} nodes={nodes} "
               f"gpus_per_node={gpus_per_node} device={torch.cuda.get_device_name(local_rank)}")
         print("[interconnect] NOTE: grep NCCL INFO for 'NET/IB' (InfiniBand) vs "
-              "'NET/Socket' (TCP), and 'NVLS'/'NVLink' for intra-node links.")
+              "'NET/Socket' (TCP); NVLink shows as intra-node channels.")
+
+    # Pre-create every pairwise group collectively (ALL ranks call new_group, in
+    # the same order). This avoids the ncclCommSplit deadlock from lazy P2P comms.
+    intra_group = dist.new_group(ranks=[0, 1]) if gpus_per_node >= 2 else None
+    inter_group = dist.new_group(ranks=[0, gpus_per_node]) if nodes >= 2 else None
+    bisec_groups = []
+    if nodes >= 2:
+        for r in range(gpus_per_node):
+            bisec_groups.append(dist.new_group(ranks=[r, r + gpus_per_node]))
 
     sizes = [1 * 1024**2, 4 * 1024**2, 16 * 1024**2, 64 * 1024**2,
              256 * 1024**2, 1024**3]
@@ -174,12 +188,9 @@ def main():
         del x
         torch.cuda.empty_cache()
 
-    # 2) intra-node NVLink p2p (rank0<->rank1) -- only if >=2 GPUs per node
-    intra_rows = bench_pair(0, 1, sizes, rank, dev) if gpus_per_node >= 2 else []
-    # 3) inter-node single-link IB p2p (rank0<->rank gpus_per_node)
-    inter_rows = bench_pair(0, gpus_per_node, sizes, rank, dev) if nodes >= 2 else []
-    # 4) inter-node aggregate bisection (all node0->node1 flows in parallel)
-    bisec_rows = bench_bisection(sizes, rank, gpus_per_node, nodes, dev) if nodes >= 2 else []
+    intra_rows = bench_pair(0, 1, intra_group, sizes, rank, dev) if intra_group is not None else []
+    inter_rows = bench_pair(0, gpus_per_node, inter_group, sizes, rank, dev) if inter_group is not None else []
+    bisec_rows = bench_bisection(bisec_groups, sizes, rank, gpus_per_node, nodes, dev) if bisec_groups else []
 
     dist.barrier()
 
@@ -211,8 +222,8 @@ def main():
         if intra_rows:
             print(f"  NVLink p2p peak (uni) : {max(r[1] for r in intra_rows):.2f} GB/s")
         if inter_rows:
-            print(f"  IB single-link (uni)  : {max(r[1] for r in inter_rows):.2f} GB/s "
-                  f"(~{max(r[1] for r in inter_rows)*8:.0f} Gb/s)")
+            peak_link = max(r[1] for r in inter_rows)
+            print(f"  IB single-link (uni)  : {peak_link:.2f} GB/s (~{peak_link*8:.0f} Gb/s)")
         if bisec_rows:
             peak_bi = max(r[1] for r in bisec_rows)
             print(f"  IB cross-node total   : {peak_bi:.2f} GB/s "

@@ -31,9 +31,11 @@ export MASTER_PORT=12345
 export WORLD_SIZE=${OMPI_COMM_WORLD_SIZE:-1}
 export RANK=${OMPI_COMM_WORLD_RANK:-0}
 
-# Make NCCL tell us which transport/channels it picks.
+# Make NCCL tell us which transport it picks (NET/IB vs NET/Socket). Keep the
+# subsystems minimal -- with one rank per GPU the INIT+NET logs are already large,
+# and GRAPH/ENV would flood the NFS tee on a 16-rank job.
 export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=INIT,NET,ENV,GRAPH
+export NCCL_DEBUG_SUBSYS=INIT,NET
 
 HOST=$(hostname)
 
