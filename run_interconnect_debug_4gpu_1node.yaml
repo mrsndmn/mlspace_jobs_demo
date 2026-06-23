@@ -1,0 +1,23 @@
+
+# 🤝 Пример запуска:
+# mls job submit --config ./run_interconnect_debug_4gpu_1node.yaml
+#
+# ВАЛИДАЦИОННЫЙ прогон на ОДНОЙ ноде с 4 GPU (world=4, 1 ранг = 1 GPU).
+# Цель: дёшево проверить, что subgroup p2p (пара 0<->1 при простаивающих
+# рангах 2,3) не приводит к дедлоку ncclCommSplit -- т.е. что eager-init
+# через device_id работает -- ПЕРЕД дорогим прогоном на 2x8 GPU.
+# Меряет: all-reduce по 4 GPU + intra-node NVLink p2p (0<->1). Inter-node
+# тесты пропускаются (nodes=1).
+
+job:
+  description: "interconnect debug VALIDATION 1x4gpu (subgroup p2p) #d.tarasov #rnd #multimodal"
+  environment:
+    image: cr.ai.cloud.ru/aicloud-base-images/cuda12.1-torch2-py311:0.0.36
+    variables:
+      PYTHONPATH: ".:./src"
+  resource:
+    workers: 1          # одна нода
+    processes: 4        # 4 ранга = по одному на GPU
+    instance_type: a100.4gpu
+  script: bash /workspace-SR004.nfs2/d.tarasov/mlspace_jobs_demo/scripts/run_interconnect_debug.sh
+  type: binary

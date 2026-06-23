@@ -152,8 +152,13 @@ def main():
               f"Submit with workers>=2.")
         return 0
 
+    # Pass device_id to enable EAGER initialization. This is essential: it makes
+    # dist.new_group() create each subgroup's NCCL comm collectively at creation
+    # time (all ranks present for the ncclCommSplit). Without it, the subgroup comm
+    # is built lazily on first use by only its 2 members, and the split -- being
+    # collective over the whole world -- deadlocks the other ranks.
     dist.init_process_group(backend="nccl", init_method="env://", rank=rank,
-                            world_size=world)
+                            world_size=world, device_id=dev)
 
     if rank == 0:
         nccl = ".".join(map(str, torch.cuda.nccl.version()))
