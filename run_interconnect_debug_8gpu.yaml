@@ -1,0 +1,26 @@
+
+# 🤝 Пример запуска:
+# mls job submit --config ./run_interconnect_debug_8gpu.yaml
+#
+# 📚 Документация: https://fbdocs.website.yandexcloud.net/pages/mlspace/jobs/quick_start.html
+#
+# Диагностика интерконнекта между ДВУМЯ 8-GPU нодами (всего 16 GPU, 1 ранг = 1 GPU):
+#   * инвентарь сети/IB (печатает локальный rank 0 каждой ноды);
+#   * NCCL бенчмарк: all-reduce по 16  GPU (NVLink+IB), p2p внутри ноды (NVLink),
+#     p2p между нодами (одна IB-линия) и bisection (8 параллельных потоков
+#     node0->node1 = суммарная межнодовая пропускная способность всех NIC).
+# Полный вывод каждого ранга также пишется в run/interconnect_debug/rank<N>_<host>.txt
+# на общий NFS (логи джоба обрезаются из-за многословного NCCL_DEBUG=INFO).
+
+job:
+  description: "interconnect debug 2x8gpu (NVLink + IB bisection) #d.tarasov #rnd #multimodal"
+  environment:
+    image: cr.ai.cloud.ru/aicloud-base-images/cuda12.1-torch2-py311:0.0.36
+    variables:
+      PYTHONPATH: ".:./src"
+  resource:
+    workers: 2          # 2 ноды
+    processes: 8        # 8 рангов на ноду = по одному процессу на GPU (torchrun-стиль)
+    instance_type: a100.8gpu
+  script: bash /workspace-SR004.nfs2/d.tarasov/mlspace_jobs_demo/scripts/run_interconnect_debug.sh
+  type: binary
