@@ -46,45 +46,49 @@ LOGFILE="$LOGDIR/rank${RANK}_${HOST}.txt"
 exec > >(tee -a "$LOGFILE") 2>&1
 echo "(full output of this rank is also saved to: $LOGFILE)"
 
-echo "########################################################################"
-echo "## NODE INVENTORY | rank=$RANK/$WORLD_SIZE | host=$HOST | master=$MASTER_ADDR"
-echo "########################################################################"
+# With one process per GPU (e.g. 8 ranks/node), only the node-local rank 0 prints
+# the hardware inventory -- otherwise it repeats once per GPU.
+LOCAL_RANK=${OMPI_COMM_WORLD_LOCAL_RANK:-0}
+if [ "$LOCAL_RANK" = "0" ]; then
+    echo "########################################################################"
+    echo "## NODE INVENTORY | rank=$RANK/$WORLD_SIZE | host=$HOST | master=$MASTER_ADDR"
+    echo "########################################################################"
 
-echo "==== [1] network interfaces (ip -br) ===="
-ip -br link 2>/dev/null
-ip -br addr 2>/dev/null
+    echo "==== [1] network interfaces (ip -br) ===="
+    ip -br link 2>/dev/null
+    ip -br addr 2>/dev/null
 
-echo "==== [2] PCI InfiniBand/Mellanox devices (lspci) ===="
-lspci 2>/dev/null | grep -iE 'mellanox|infiniband|connectx' || echo "(none found / lspci unavailable)"
+    echo "==== [2] PCI InfiniBand/Mellanox devices (lspci) ===="
+    lspci 2>/dev/null | grep -iE 'mellanox|infiniband|connectx' || echo "(none found / lspci unavailable)"
 
-echo "==== [3] /sys/class/infiniband (authoritative IB/RoCE presence) ===="
-if [ -d /sys/class/infiniband ] && [ -n "$(ls -A /sys/class/infiniband 2>/dev/null)" ]; then
-    for dev in /sys/class/infiniband/*; do
-        echo "HCA: $(basename "$dev")  fw=$(cat "$dev/fw_ver" 2>/dev/null)  node_guid=$(cat "$dev/node_guid" 2>/dev/null)"
-        for port in "$dev"/ports/*; do
-            echo "  port $(basename "$port"): state=$(cat "$port/state" 2>/dev/null) | phys=$(cat "$port/phys_state" 2>/dev/null) | rate=$(cat "$port/rate" 2>/dev/null) | link_layer=$(cat "$port/link_layer" 2>/dev/null)"
+    echo "==== [3] /sys/class/infiniband (authoritative IB/RoCE presence) ===="
+    if [ -d /sys/class/infiniband ] && [ -n "$(ls -A /sys/class/infiniband 2>/dev/null)" ]; then
+        for dev in /sys/class/infiniband/*; do
+            echo "HCA: $(basename "$dev")  fw=$(cat "$dev/fw_ver" 2>/dev/null)  node_guid=$(cat "$dev/node_guid" 2>/dev/null)"
+            for port in "$dev"/ports/*; do
+                echo "  port $(basename "$port"): state=$(cat "$port/state" 2>/dev/null) | phys=$(cat "$port/phys_state" 2>/dev/null) | rate=$(cat "$port/rate" 2>/dev/null) | link_layer=$(cat "$port/link_layer" 2>/dev/null)"
+            done
         done
-    done
-else
-    echo "(no /sys/class/infiniband entries -> NO InfiniBand/RoCE HCA visible on this node)"
+    else
+        echo "(no /sys/class/infiniband entries -> NO InfiniBand/RoCE HCA visible on this node)"
+    fi
+
+    echo "==== [4] ibstat / ibv_devinfo (if rdma-core/perftest installed) ===="
+    if command -v ibstat >/dev/null 2>&1; then ibstat; else echo "(ibstat not installed)"; fi
+    if command -v ibv_devinfo >/dev/null 2>&1; then ibv_devinfo 2>/dev/null; else echo "(ibv_devinfo not installed)"; fi
+
+    echo "==== [5] UCX transports (HPCX) ===="
+    if command -v ucx_info >/dev/null 2>&1; then
+        ucx_info -v 2>/dev/null | head -3
+        ucx_info -d 2>/dev/null | grep -iE 'Transport|Device:|bandwidth|latency' | head -60
+    else
+        echo "(ucx_info not available)"
+    fi
+
+    echo "==== [6] GPU <-> NIC topology (nvidia-smi topo -m) ===="
+    if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi topo -m 2>/dev/null; else echo "(nvidia-smi unavailable)"; fi
+    echo
 fi
-
-echo "==== [4] ibstat / ibv_devinfo (if rdma-core/perftest installed) ===="
-if command -v ibstat >/dev/null 2>&1; then ibstat; else echo "(ibstat not installed)"; fi
-if command -v ibv_devinfo >/dev/null 2>&1; then ibv_devinfo 2>/dev/null; else echo "(ibv_devinfo not installed)"; fi
-
-echo "==== [5] UCX transports (HPCX) ===="
-if command -v ucx_info >/dev/null 2>&1; then
-    ucx_info -v 2>/dev/null | head -3
-    ucx_info -d 2>/dev/null | grep -iE 'Transport|Device:|bandwidth|latency' | head -60
-else
-    echo "(ucx_info not available)"
-fi
-
-echo "==== [6] GPU <-> NIC topology (nvidia-smi topo -m) ===="
-if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi topo -m 2>/dev/null; else echo "(nvidia-smi unavailable)"; fi
-
-echo
 echo "########################################################################"
 echo "## NCCL BANDWIDTH BENCHMARK (inter-node) | starting from rank=$RANK"
 echo "########################################################################"
