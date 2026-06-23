@@ -1,0 +1,26 @@
+
+# 🤝 Пример запуска:
+# mls job submit --config ./run_interconnect_debug.yaml
+#
+# 📚 Документация: https://fbdocs.website.yandexcloud.net/pages/mlspace/jobs/quick_start.html
+#
+# Диагностика межнодового интерконнекта на 2 нодах:
+#   * каждая нода печатает инвентарь сети/IB (ip, lspci, /sys/class/infiniband,
+#     ibstat, ucx_info, nvidia-smi topo);
+#   * запускается torch.distributed (NCCL) бенчмарк между нодами и печатается
+#     пропускная способность каналов (all-reduce busbw + p2p send/recv GB/s);
+#   * NCCL_DEBUG=INFO показывает, использует ли NCCL IB (NET/IB) или сокеты (NET/Socket).
+# Джоб печатает всё в логи и завершается (exit 0). Ничего не остаётся запущенным.
+
+job:
+  description: "interconnect debug (IB + NCCL bandwidth) 2 nodes #d.tarasov #rnd #multimodal"
+  environment:
+    image: cr.ai.cloud.ru/aicloud-base-images/cuda12.1-torch2-py311:0.0.36
+    variables:
+      PYTHONPATH: ".:./src"
+  resource:
+    workers: 2          # 2 ноды -> межнодовый интерконнект
+    processes: 1        # 1 процесс (1 ранг) на ноду; нужно для inter-node измерения
+    instance_type: a100.1gpu
+  script: bash /workspace-SR004.nfs2/d.tarasov/mlspace_jobs_demo/scripts/run_interconnect_debug.sh
+  type: binary
