@@ -4,19 +4,21 @@
 Launched via MPI, one rank per GPU (see run_interconnect_debug.sh). With
 gpus_per_node=G and N nodes the world has N*G ranks. We measure:
 
-  * all-reduce over ALL ranks            -> aggregate collective bw (NVLink+IB mix)
-  * p2p rank0<->rank1   (same node)      -> intra-node NVLink bw   (if G >= 2)
-  * p2p rank0<->rankG   (other node)     -> single inter-node IB link bw (if N >= 2)
-  * inter-node bisection (G parallel     -> total cross-node bw with all NICs
-    node0->node1 flows)                     (if N >= 2)
+  * all-reduce over ALL ranks         -> aggregate bw; with N>1 this is bounded by
+                                         the INTER-node link (the ring crosses nodes)
+  * all-reduce within each node (G)    -> intra-node NVLink bw at scale
+  * p2p rank0<->rank1 (same node)      -> intra-node NVLink point-to-point (if G>=2)
 
 All results in GB/s. Whether NCCL uses InfiniBand or TCP is printed by NCCL
 itself (NCCL_DEBUG=INFO): grep the logs for 'NET/IB' vs 'NET/Socket'.
 
-IMPORTANT: every pairwise communicator is created up front with dist.new_group()
-which ALL ranks call collectively. Lazy/implicit P2P comm creation goes through
-ncclCommSplit (collective over the whole world), so creating it on-demand from
-only the 2 pair members deadlocks the other ranks.
+Design notes (learned the hard way):
+  * Subgroup NCCL comms are created via ncclCommSplit, which is COLLECTIVE over the
+    whole world. We pass device_id to init_process_group so new_group() builds them
+    EAGERLY (all ranks present) instead of lazily on first use (which deadlocks).
+  * We only ever build SAME-NODE subgroups. Cross-node 2-rank subgroups proved
+    fragile here, so inter-node bandwidth is read from the world all-reduce (which
+    is inter-node-bound) rather than from per-pair p2p.
 """
 import os
 
@@ -58,6 +60,24 @@ def time_op(op, iters, warmup, dev):
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / 1000.0 / iters
+
+
+def bench_allreduce(sizes, dev, rank, group, gsize, report_rank):
+    """all-reduce within `group` (None = world). All ranks call; the timed op uses
+    each rank's own `group`. Rows returned only on report_rank."""
+    rows = []
+    for nbytes in sizes:
+        x = torch.ones(nbytes // 4, dtype=torch.float32, device=dev)
+        iters, warmup = iters_for(nbytes)
+        t = time_op(lambda: dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group),
+                    iters, warmup, dev)
+        algbw = gbps(nbytes, t)
+        busbw = algbw * 2 * (gsize - 1) / gsize
+        if rank == report_rank:
+            rows.append((nbytes, t, algbw, busbw))
+        del x
+        torch.cuda.empty_cache()
+    return rows
 
 
 def bench_pair(lo, hi, group, sizes, rank, dev):
@@ -102,41 +122,6 @@ def bench_pair(lo, hi, group, sizes, rank, dev):
     return rows
 
 
-def bench_bisection(groups, sizes, rank, gpus_per_node, nodes, dev):
-    """All node0 GPUs send to their node1 counterpart at once (group i = {i, i+G}).
-    Aggregate = (G * msg) / slowest-flow-time. Rows on rank 0."""
-    rows = []
-    node = rank // gpus_per_node
-    part = nodes >= 2 and node in (0, 1)
-    group = groups[rank % gpus_per_node] if part else None
-    is_sender = part and node == 0
-    for nbytes in sizes:
-        iters, warmup = iters_for(nbytes)
-        if part:
-            n = nbytes // 4
-            sbuf = torch.ones(n, dtype=torch.float32, device=dev)
-            rbuf = torch.empty(n, dtype=torch.float32, device=dev)
-
-            def op():
-                if is_sender:
-                    dist.send(sbuf, group=group, group_dst=1)
-                else:
-                    dist.recv(rbuf, group=group, group_src=0)
-        else:
-            def op():
-                pass
-
-        t = time_op(op, iters, warmup, dev)
-        tt = torch.tensor([t], device=dev)
-        dist.all_reduce(tt, op=dist.ReduceOp.MAX)  # slowest flow bounds completion
-        if rank == 0:
-            rows.append((nbytes, gbps(nbytes * gpus_per_node, tt.item())))
-        if part:
-            del sbuf, rbuf
-            torch.cuda.empty_cache()
-    return rows
-
-
 def main():
     rank = int(os.environ.get("RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
@@ -152,11 +137,8 @@ def main():
               f"Submit with workers>=2.")
         return 0
 
-    # Pass device_id to enable EAGER initialization. This is essential: it makes
-    # dist.new_group() create each subgroup's NCCL comm collectively at creation
-    # time (all ranks present for the ncclCommSplit). Without it, the subgroup comm
-    # is built lazily on first use by only its 2 members, and the split -- being
-    # collective over the whole world -- deadlocks the other ranks.
+    # device_id -> EAGER init so new_group() builds same-node subgroup comms
+    # collectively at creation (avoids the lazy ncclCommSplit deadlock).
     dist.init_process_group(backend="nccl", init_method="env://", rank=rank,
                             world_size=world, device_id=dev)
 
@@ -167,72 +149,49 @@ def main():
         print(f"[interconnect] world_size={world} nodes={nodes} "
               f"gpus_per_node={gpus_per_node} device={torch.cuda.get_device_name(local_rank)}")
         print("[interconnect] NOTE: grep NCCL INFO for 'NET/IB' (InfiniBand) vs "
-              "'NET/Socket' (TCP); NVLink shows as intra-node channels.")
+              "'NET/Socket' (TCP); inter-node bw = world all-reduce busbw below.")
 
-    # Pre-create every pairwise group collectively (ALL ranks call new_group, in
-    # the same order). This avoids the ncclCommSplit deadlock from lazy P2P comms.
+    # Same-node subgroups only (built eagerly, all ranks call new_group in order).
+    node_groups = [dist.new_group(ranks=list(range(n * gpus_per_node,
+                                                    (n + 1) * gpus_per_node)))
+                   for n in range(nodes)]
+    my_node_group = node_groups[rank // gpus_per_node]
     intra_group = dist.new_group(ranks=[0, 1]) if gpus_per_node >= 2 else None
-    inter_group = dist.new_group(ranks=[0, gpus_per_node]) if nodes >= 2 else None
-    bisec_groups = []
-    if nodes >= 2:
-        for r in range(gpus_per_node):
-            bisec_groups.append(dist.new_group(ranks=[r, r + gpus_per_node]))
 
     sizes = [1 * 1024**2, 4 * 1024**2, 16 * 1024**2, 64 * 1024**2,
              256 * 1024**2, 1024**3]
 
-    # 1) all-reduce over all ranks (NVLink + IB combined)
-    ar_rows = []
-    for nbytes in sizes:
-        x = torch.ones(nbytes // 4, dtype=torch.float32, device=dev)
-        iters, warmup = iters_for(nbytes)
-        t = time_op(lambda: dist.all_reduce(x, op=dist.ReduceOp.SUM), iters, warmup, dev)
-        algbw = gbps(nbytes, t)
-        busbw = algbw * 2 * (world - 1) / world
-        ar_rows.append((nbytes, t, algbw, busbw))
-        del x
-        torch.cuda.empty_cache()
-
+    world_rows = bench_allreduce(sizes, dev, rank, None, world, report_rank=0)
+    node_rows = bench_allreduce(sizes, dev, rank, my_node_group, gpus_per_node,
+                                report_rank=0) if nodes >= 2 else []
     intra_rows = bench_pair(0, 1, intra_group, sizes, rank, dev) if intra_group is not None else []
-    inter_rows = bench_pair(0, gpus_per_node, inter_group, sizes, rank, dev) if inter_group is not None else []
-    bisec_rows = bench_bisection(bisec_groups, sizes, rank, gpus_per_node, nodes, dev) if bisec_groups else []
 
     dist.barrier()
 
     if rank == 0:
-        print(f"\n========== ALL-REDUCE over {world} ranks (NVLink+IB) ==========")
-        print(f"{'size':>8} | {'time(ms)':>9} | {'algbw(GB/s)':>11} | {'busbw(GB/s)':>11}")
-        for nbytes, t, algbw, busbw in ar_rows:
-            print(f"{fmt_size(nbytes):>8} | {t*1e3:9.3f} | {algbw:11.2f} | {busbw:11.2f}")
-
-        def ptab(title, rows):
+        def artab(title, rows):
             print(f"\n========== {title} ==========")
+            print(f"{'size':>8} | {'time(ms)':>9} | {'algbw(GB/s)':>11} | {'busbw(GB/s)':>11}")
+            for nbytes, t, algbw, busbw in rows:
+                print(f"{fmt_size(nbytes):>8} | {t*1e3:9.3f} | {algbw:11.2f} | {busbw:11.2f}")
+
+        artab(f"ALL-REDUCE over ALL {world} ranks (INTER-node bound)", world_rows)
+        if node_rows:
+            artab(f"ALL-REDUCE within one node ({gpus_per_node} GPUs, NVLink)", node_rows)
+        if intra_rows:
+            print(f"\n========== INTRA-node p2p rank0<->rank1 (NVLink) ==========")
             print(f"{'size':>8} | {'uni(GB/s)':>10} | {'bidir/dir':>10}")
-            for nbytes, uni, bi in rows:
+            for nbytes, uni, bi in intra_rows:
                 print(f"{fmt_size(nbytes):>8} | {uni:10.2f} | {bi:10.2f}")
 
-        if intra_rows:
-            ptab("INTRA-node p2p rank0<->rank1 (NVLink)", intra_rows)
-        if inter_rows:
-            ptab(f"INTER-node p2p rank0<->rank{gpus_per_node} (single IB link)", inter_rows)
-        if bisec_rows:
-            print(f"\n===== INTER-node BISECTION: {gpus_per_node} parallel node0->node1 "
-                  f"flows (total cross-node) =====")
-            print(f"{'size':>8} | {'aggregate(GB/s)':>16}")
-            for nbytes, agg in bisec_rows:
-                print(f"{fmt_size(nbytes):>8} | {agg:16.2f}")
-
         print("\n[interconnect] SUMMARY")
-        print(f"  all-reduce peak busbw : {max(r[3] for r in ar_rows):.2f} GB/s")
+        w_peak = max(r[3] for r in world_rows)
+        print(f"  world all-reduce busbw (inter-node) : {w_peak:.2f} GB/s (~{w_peak*8:.0f} Gb/s)")
+        if node_rows:
+            n_peak = max(r[3] for r in node_rows)
+            print(f"  per-node all-reduce busbw (NVLink)  : {n_peak:.2f} GB/s")
         if intra_rows:
-            print(f"  NVLink p2p peak (uni) : {max(r[1] for r in intra_rows):.2f} GB/s")
-        if inter_rows:
-            peak_link = max(r[1] for r in inter_rows)
-            print(f"  IB single-link (uni)  : {peak_link:.2f} GB/s (~{peak_link*8:.0f} Gb/s)")
-        if bisec_rows:
-            peak_bi = max(r[1] for r in bisec_rows)
-            print(f"  IB cross-node total   : {peak_bi:.2f} GB/s "
-                  f"(~{peak_bi*8:.0f} Gb/s over {gpus_per_node} NIC paths)")
+            print(f"  NVLink p2p peak (uni)               : {max(r[1] for r in intra_rows):.2f} GB/s")
 
     dist.destroy_process_group()
     return 0
