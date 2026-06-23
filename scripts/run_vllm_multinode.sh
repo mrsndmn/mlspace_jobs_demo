@@ -43,8 +43,13 @@ mkdir -p "$SENTINEL_DIR"
 cd "$WORKDIR"
 export PATH="$ENV_PREFIX:$PATH"
 
-RAY_BIN="$ENV_PREFIX/ray"
 PY_BIN="$ENV_PREFIX/python"
+# The env was created under /home/jovyan/.mlspace/... so the `ray`/`vllm` console
+# scripts have a shebang pointing at an interpreter path that does NOT exist on the
+# job nodes (they mount the env at /workspace-SR004.nfs2/...). Invoke them THROUGH
+# the env's python (a real binary) to bypass the stale shebang. See the run logs:
+#   "bad interpreter: /home/jovyan/.mlspace/envs/vllm_cu126/bin/python3.11"
+RAY_BIN="$PY_BIN $ENV_PREFIX/ray"
 
 if [ "$RANK" = "0" ]; then
     # ============================ HEAD NODE ============================
@@ -52,8 +57,8 @@ if [ "$RANK" = "0" ]; then
     # after the head is up, so they will never observe a stale DONE.
     rm -f "$DONE_SENTINEL"
 
-    "$RAY_BIN" stop || true
-    "$RAY_BIN" start --head --port "$RAY_PORT" --num-gpus 1 --include-dashboard=false
+    $RAY_BIN stop || true
+    $RAY_BIN start --head --port "$RAY_PORT" --num-gpus 1 --include-dashboard=false
 
     # Run serve + self-test. Always drop the sentinel afterwards so the
     # worker can exit even if the orchestrator crashes.
@@ -71,15 +76,15 @@ if [ "$RANK" = "0" ]; then
     set -e
 
     touch "$DONE_SENTINEL"
-    "$RAY_BIN" stop || true
+    $RAY_BIN stop || true
     echo "HEAD finished with rc=$RC"
     exit $RC
 else
     # =========================== WORKER NODE ==========================
     # Retry the join until the head's Ray is reachable.
-    until "$RAY_BIN" start --address "$RAY_ADDRESS" --num-gpus 1; do
+    until $RAY_BIN start --address "$RAY_ADDRESS" --num-gpus 1; do
         echo "head $RAY_ADDRESS not ready yet, retrying Ray join in 5s..."
-        "$RAY_BIN" stop || true
+        $RAY_BIN stop || true
         sleep 5
     done
 
@@ -89,6 +94,6 @@ else
     done
 
     echo "WORKER saw DONE sentinel, stopping Ray and exiting."
-    "$RAY_BIN" stop || true
+    $RAY_BIN stop || true
     exit 0
 fi

@@ -51,7 +51,11 @@ def wait_for_ray_cluster(expected_nodes, expected_gpus, timeout=600):
 
 def log_ray_status(ray_bin):
     try:
-        out = subprocess.run([ray_bin, "status"], capture_output=True, text=True, timeout=60)
+        # Invoke the `ray` console script through the current interpreter: the env
+        # was created elsewhere, so the script's own shebang points at a missing
+        # interpreter path on the job nodes.
+        out = subprocess.run([sys.executable, ray_bin, "status"],
+                             capture_output=True, text=True, timeout=60)
         log("`ray status`:\n" + out.stdout + (out.stderr or ""))
     except Exception as e:  # noqa: BLE001 - best-effort logging
         log(f"could not run `ray status`: {e}")
@@ -119,8 +123,10 @@ def main():
         log_ray_status(ray_bin)
 
         # 2. Launch the server spanning the cluster (Ray backend, PP across nodes).
+        #    Run the `vllm` console script through this interpreter to bypass its
+        #    stale shebang (env created under a different mount path).
         cmd = [
-            vllm_bin, "serve", args.model,
+            sys.executable, vllm_bin, "serve", args.model,
             "--port", str(args.port),
             "--served-model-name", args.served_name,
             "--pipeline-parallel-size", str(args.pipeline_parallel_size),
