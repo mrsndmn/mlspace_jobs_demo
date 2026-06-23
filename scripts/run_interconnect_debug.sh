@@ -37,11 +37,13 @@ export RANK=${OMPI_COMM_WORLD_RANK:-0}
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET
 
-# Force the Tree all-reduce algorithm. On this 2x8 InfiniBand topology the Ring
-# algorithm (which NCCL auto-selects for messages >~2-4MB) wedges during ring
-# channel setup, so small messages pass but >=4MB hang. Tree connected and ran
-# fine for small messages, so pinning Tree makes the full sweep complete.
-export NCCL_ALGO=Tree
+# KNOWN LIMITATION (2 x a100.8gpu = 16 ranks): the inter-node all-reduce hangs
+# non-deterministically once channels ramp up (small messages sometimes pass,
+# >=4MB / ring setup wedges; NCCL_ALGO=Tree did not help). This looks like a
+# NCCL/IB-fabric issue at this scale, NOT a script bug -- the same script runs
+# cleanly at 1 GPU/node (2 ranks, inter-node) and 4-8 GPUs on a single node.
+# Next things to try if revisiting: pin rail-local NICs via NCCL_IB_HCA,
+# NCCL_CROSS_NIC=0/1, a newer NCCL, or a fabric health check (ibdiagnet).
 
 HOST=$(hostname)
 
