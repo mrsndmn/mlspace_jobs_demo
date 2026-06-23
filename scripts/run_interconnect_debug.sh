@@ -37,6 +37,12 @@ export RANK=${OMPI_COMM_WORLD_RANK:-0}
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET
 
+# Force the Tree all-reduce algorithm. On this 2x8 InfiniBand topology the Ring
+# algorithm (which NCCL auto-selects for messages >~2-4MB) wedges during ring
+# channel setup, so small messages pass but >=4MB hang. Tree connected and ran
+# fine for small messages, so pinning Tree makes the full sweep complete.
+export NCCL_ALGO=Tree
+
 HOST=$(hostname)
 
 # NCCL_DEBUG=INFO is very verbose, and `mls job logs` only returns a tail window,
