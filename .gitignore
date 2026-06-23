@@ -2,5 +2,6 @@ trainer_output/
 bert_finetune*
 bert_finetune_multigpu*
 train_demo_lr_*
+run/
 
 
