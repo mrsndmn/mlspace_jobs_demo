@@ -36,6 +36,16 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET,ENV,GRAPH
 
 HOST=$(hostname)
+
+# NCCL_DEBUG=INFO is very verbose, and `mls job logs` only returns a tail window,
+# which can hide the early inventory. Also persist the FULL per-node output to a
+# file on the shared NFS so nothing is lost to log truncation.
+LOGDIR="$WORKDIR/run/interconnect_debug"
+mkdir -p "$LOGDIR"
+LOGFILE="$LOGDIR/rank${RANK}_${HOST}.txt"
+exec > >(tee -a "$LOGFILE") 2>&1
+echo "(full output of this rank is also saved to: $LOGFILE)"
+
 echo "########################################################################"
 echo "## NODE INVENTORY | rank=$RANK/$WORLD_SIZE | host=$HOST | master=$MASTER_ADDR"
 echo "########################################################################"
