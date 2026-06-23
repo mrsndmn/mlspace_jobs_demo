@@ -1,0 +1,23 @@
+
+# 🤝 Пример запуска:
+# mls job submit --config ./run_vllm_multinode.yaml
+#
+# 📚 Документация по запуску задач: https://fbdocs.website.yandexcloud.net/pages/mlspace/jobs/quick_start.html
+#
+# Multinode vLLM serve demo: поднимает Ray-кластер на 2 нодах и запускает
+# `vllm serve HuggingFaceTB/SmolLM2-135M` c pipeline_parallel_size=2 (одна стадия на ноду).
+# Голова делает self-test (/v1/completions) и завершает джоб с кодом 0.
+# Подробности решений: docs/adr/0001-*, docs/adr/0002-*.
+
+job:
+  description: "vLLM multinode serve SmolLM2-135M #d.tarasov #rnd #multimodal"
+  environment:
+    image: cr.ai.cloud.ru/aicloud-base-images/cuda12.1-torch2-py311:0.0.36
+    variables:
+      PYTHONPATH: ".:./src"
+  resource:
+    workers: 2          # 2 ноды = 2 стадии pipeline parallel
+    processes: 1        # 1 процесс (один Ray-демон) на ноду, НЕ по числу GPU
+    instance_type: a100.1gpu
+  script: bash /workspace-SR004.nfs2/d.tarasov/mlspace_jobs_demo/scripts/run_vllm_multinode.sh
+  type: binary
