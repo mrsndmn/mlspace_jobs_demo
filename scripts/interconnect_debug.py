@@ -1,24 +1,23 @@
 #!/usr/bin/env python
-"""Interconnect benchmark over torch.distributed (NCCL), any #GPUs/node.
+"""Interconnect bandwidth benchmark over torch.distributed (NCCL).
 
-Launched via MPI, one rank per GPU (see run_interconnect_debug.sh). With
-gpus_per_node=G and N nodes the world has N*G ranks. We measure:
+Launched via MPI, one rank per GPU (see run_interconnect_debug.sh). Runs the
+canonical all-reduce bandwidth sweep over ALL ranks -- nothing else, no
+subgroups. Interpretation depends on the job shape:
 
-  * all-reduce over ALL ranks         -> aggregate bw; with N>1 this is bounded by
-                                         the INTER-node link (the ring crosses nodes)
-  * all-reduce within each node (G)    -> intra-node NVLink bw at scale
-  * p2p rank0<->rank1 (same node)      -> intra-node NVLink point-to-point (if G>=2)
+  * 2 nodes x G GPUs  -> the all-reduce ring crosses the node boundary, so busbw
+                         is bounded by the INTER-node link (InfiniBand). This is
+                         the "interconnect between the two nodes" number.
+  * 1 node  x G GPUs  -> stays on-node, so busbw reflects intra-node NVLink.
 
-All results in GB/s. Whether NCCL uses InfiniBand or TCP is printed by NCCL
-itself (NCCL_DEBUG=INFO): grep the logs for 'NET/IB' vs 'NET/Socket'.
+Run both shapes to contrast NVLink vs IB. busbw = algbw * 2*(n-1)/n is the
+standard NCCL "bus bandwidth" (comparable to nccl-tests all_reduce_perf).
 
-Design notes (learned the hard way):
-  * Subgroup NCCL comms are created via ncclCommSplit, which is COLLECTIVE over the
-    whole world. We pass device_id to init_process_group so new_group() builds them
-    EAGERLY (all ranks present) instead of lazily on first use (which deadlocks).
-  * We only ever build SAME-NODE subgroups. Cross-node 2-rank subgroups proved
-    fragile here, so inter-node bandwidth is read from the world all-reduce (which
-    is inter-node-bound) rather than from per-pair p2p.
+Deliberately NO dist.new_group / p2p subgroups: creating a subgroup NCCL comm
+goes through ncclCommSplit (collective over the whole world) and reliably
+deadlocked this 2x8 setup. The world all-reduce needs no subgroup and is robust.
+Whether NCCL uses IB or TCP is printed by NCCL itself (NCCL_DEBUG=INFO): grep
+the logs for 'NET/IB' vs 'NET/Socket'.
 """
 import os
 
@@ -47,7 +46,6 @@ def iters_for(nbytes):
 
 
 def time_op(op, iters, warmup, dev):
-    """Mean seconds/op via CUDA events. EVERY rank must call this (barrier inside)."""
     for _ in range(warmup):
         op()
     torch.cuda.synchronize()
@@ -60,66 +58,6 @@ def time_op(op, iters, warmup, dev):
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / 1000.0 / iters
-
-
-def bench_allreduce(sizes, dev, rank, group, gsize, report_rank):
-    """all-reduce within `group` (None = world). All ranks call; the timed op uses
-    each rank's own `group`. Rows returned only on report_rank."""
-    rows = []
-    for nbytes in sizes:
-        x = torch.ones(nbytes // 4, dtype=torch.float32, device=dev)
-        iters, warmup = iters_for(nbytes)
-        t = time_op(lambda: dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group),
-                    iters, warmup, dev)
-        algbw = gbps(nbytes, t)
-        busbw = algbw * 2 * (gsize - 1) / gsize
-        if rank == report_rank:
-            rows.append((nbytes, t, algbw, busbw))
-        del x
-        torch.cuda.empty_cache()
-    return rows
-
-
-def bench_pair(lo, hi, group, sizes, rank, dev):
-    """p2p between global ranks lo<hi using a pre-created 2-rank `group`
-    (group-local 0=lo, 1=hi). ALL ranks call this; non-members no-op so the
-    per-op barriers stay aligned. Rows returned only on rank lo."""
-    rows = []
-    part = rank in (lo, hi)
-    peer_local = (1 if rank == lo else 0) if part else None
-    for nbytes in sizes:
-        iters, warmup = iters_for(nbytes)
-        if part:
-            n = nbytes // 4
-            sbuf = torch.ones(n, dtype=torch.float32, device=dev)
-            rbuf = torch.empty(n, dtype=torch.float32, device=dev)
-
-            def uni():
-                if rank == lo:
-                    dist.send(sbuf, group=group, group_dst=1)
-                else:
-                    dist.recv(rbuf, group=group, group_src=0)
-
-            def bidir():
-                ops = [dist.P2POp(dist.isend, sbuf, group=group, group_peer=peer_local),
-                       dist.P2POp(dist.irecv, rbuf, group=group, group_peer=peer_local)]
-                for w in dist.batch_isend_irecv(ops):
-                    w.wait()
-        else:
-            def uni():
-                pass
-
-            def bidir():
-                pass
-
-        t_uni = time_op(uni, iters, warmup, dev)
-        t_bi = time_op(bidir, iters, warmup, dev)
-        if rank == lo:
-            rows.append((nbytes, gbps(nbytes, t_uni), gbps(nbytes, t_bi)))
-        if part:
-            del sbuf, rbuf
-            torch.cuda.empty_cache()
-    return rows
 
 
 def main():
@@ -137,61 +75,47 @@ def main():
               f"Submit with workers>=2.")
         return 0
 
-    # device_id -> EAGER init so new_group() builds same-node subgroup comms
-    # collectively at creation (avoids the lazy ncclCommSplit deadlock).
     dist.init_process_group(backend="nccl", init_method="env://", rank=rank,
-                            world_size=world, device_id=dev)
+                            world_size=world)
 
+    scope = "INTER-node (IB)" if nodes >= 2 else "intra-node (NVLink)"
     if rank == 0:
         nccl = ".".join(map(str, torch.cuda.nccl.version()))
         print(f"[interconnect] torch={torch.__version__} cuda={torch.version.cuda} "
               f"nccl={nccl}")
         print(f"[interconnect] world_size={world} nodes={nodes} "
               f"gpus_per_node={gpus_per_node} device={torch.cuda.get_device_name(local_rank)}")
+        print(f"[interconnect] all-reduce scope: {scope}")
         print("[interconnect] NOTE: grep NCCL INFO for 'NET/IB' (InfiniBand) vs "
-              "'NET/Socket' (TCP); inter-node bw = world all-reduce busbw below.")
-
-    # Same-node subgroups only (built eagerly, all ranks call new_group in order).
-    node_groups = [dist.new_group(ranks=list(range(n * gpus_per_node,
-                                                    (n + 1) * gpus_per_node)))
-                   for n in range(nodes)]
-    my_node_group = node_groups[rank // gpus_per_node]
-    intra_group = dist.new_group(ranks=[0, 1]) if gpus_per_node >= 2 else None
+              "'NET/Socket' (TCP).")
 
     sizes = [1 * 1024**2, 4 * 1024**2, 16 * 1024**2, 64 * 1024**2,
-             256 * 1024**2, 1024**3]
+             256 * 1024**2, 512 * 1024**2, 1024**3]
 
-    world_rows = bench_allreduce(sizes, dev, rank, None, world, report_rank=0)
-    node_rows = bench_allreduce(sizes, dev, rank, my_node_group, gpus_per_node,
-                                report_rank=0) if nodes >= 2 else []
-    intra_rows = bench_pair(0, 1, intra_group, sizes, rank, dev) if intra_group is not None else []
+    rows = []
+    for nbytes in sizes:
+        x = torch.ones(nbytes // 4, dtype=torch.float32, device=dev)
+        iters, warmup = iters_for(nbytes)
+        t = time_op(lambda: dist.all_reduce(x, op=dist.ReduceOp.SUM), iters, warmup, dev)
+        algbw = gbps(nbytes, t)
+        busbw = algbw * 2 * (world - 1) / world
+        rows.append((nbytes, t, algbw, busbw))
+        del x
+        torch.cuda.empty_cache()
 
     dist.barrier()
 
     if rank == 0:
-        def artab(title, rows):
-            print(f"\n========== {title} ==========")
-            print(f"{'size':>8} | {'time(ms)':>9} | {'algbw(GB/s)':>11} | {'busbw(GB/s)':>11}")
-            for nbytes, t, algbw, busbw in rows:
-                print(f"{fmt_size(nbytes):>8} | {t*1e3:9.3f} | {algbw:11.2f} | {busbw:11.2f}")
-
-        artab(f"ALL-REDUCE over ALL {world} ranks (INTER-node bound)", world_rows)
-        if node_rows:
-            artab(f"ALL-REDUCE within one node ({gpus_per_node} GPUs, NVLink)", node_rows)
-        if intra_rows:
-            print(f"\n========== INTRA-node p2p rank0<->rank1 (NVLink) ==========")
-            print(f"{'size':>8} | {'uni(GB/s)':>10} | {'bidir/dir':>10}")
-            for nbytes, uni, bi in intra_rows:
-                print(f"{fmt_size(nbytes):>8} | {uni:10.2f} | {bi:10.2f}")
-
-        print("\n[interconnect] SUMMARY")
-        w_peak = max(r[3] for r in world_rows)
-        print(f"  world all-reduce busbw (inter-node) : {w_peak:.2f} GB/s (~{w_peak*8:.0f} Gb/s)")
-        if node_rows:
-            n_peak = max(r[3] for r in node_rows)
-            print(f"  per-node all-reduce busbw (NVLink)  : {n_peak:.2f} GB/s")
-        if intra_rows:
-            print(f"  NVLink p2p peak (uni)               : {max(r[1] for r in intra_rows):.2f} GB/s")
+        print(f"\n========== ALL-REDUCE over {world} ranks -- {scope} ==========")
+        print(f"{'size':>8} | {'time(ms)':>9} | {'algbw(GB/s)':>11} | {'busbw(GB/s)':>11}")
+        for nbytes, t, algbw, busbw in rows:
+            print(f"{fmt_size(nbytes):>8} | {t*1e3:9.3f} | {algbw:11.2f} | {busbw:11.2f}")
+        peak = max(r[3] for r in rows)
+        print(f"\n[interconnect] SUMMARY ({scope})")
+        print(f"  peak all-reduce busbw : {peak:.2f} GB/s (~{peak*8:.0f} Gb/s)")
+        if nodes >= 2:
+            print("  -> this is the effective cross-node bandwidth NCCL achieves over "
+                  "the InfiniBand fabric (all NICs combined).")
 
     dist.destroy_process_group()
     return 0
