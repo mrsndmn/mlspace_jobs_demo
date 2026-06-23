@@ -95,7 +95,8 @@ echo "########################################################################"
 echo "## NCCL BANDWIDTH BENCHMARK (inter-node) | starting from rank=$RANK"
 echo "########################################################################"
 cd "$WORKDIR"
-"$PY_BIN" scripts/interconnect_debug.py
+export PYTHONUNBUFFERED=1
+"$PY_BIN" -u scripts/interconnect_debug.py
 RC=$?
 echo "rank=$RANK interconnect_debug.py exited rc=$RC"
 exit $RC

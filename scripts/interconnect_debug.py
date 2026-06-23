@@ -49,7 +49,7 @@ def time_op(op, iters, warmup, dev):
     for _ in range(warmup):
         op()
     torch.cuda.synchronize()
-    dist.barrier()
+    dist.barrier(device_ids=[dev.index])  # pin device so NCCL barrier can't mis-guess
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -94,12 +94,17 @@ def main():
 
     rows = []
     for nbytes in sizes:
+        if rank == 0:
+            print(f"[interconnect] measuring all-reduce {fmt_size(nbytes)} ...", flush=True)
         x = torch.ones(nbytes // 4, dtype=torch.float32, device=dev)
         iters, warmup = iters_for(nbytes)
         t = time_op(lambda: dist.all_reduce(x, op=dist.ReduceOp.SUM), iters, warmup, dev)
         algbw = gbps(nbytes, t)
         busbw = algbw * 2 * (world - 1) / world
         rows.append((nbytes, t, algbw, busbw))
+        if rank == 0:
+            print(f"[interconnect]   {fmt_size(nbytes)}: time={t*1e3:.3f}ms "
+                  f"algbw={algbw:.2f} busbw={busbw:.2f} GB/s", flush=True)
         del x
         torch.cuda.empty_cache()
 
